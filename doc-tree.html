@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>文档目录树组件</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+
+    .sortable-ghost {
+      opacity: 0.4;
+      background: #e0e7ff;
+      border-radius: 4px;
+    }
+    .sortable-chosen {
+      background: #f0f4ff;
+    }
+    .sortable-drag {
+      opacity: 0.9;
+    }
+
+    .tree-scroll::-webkit-scrollbar { width: 6px; }
+    .tree-scroll::-webkit-scrollbar-track { background: #f1f5f9; border-radius: 3px; }
+    .tree-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+    .tree-scroll::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+  </style>
+</head>
+<body class="bg-gray-100 min-h-screen flex items-start justify-center pt-10">
+
+  <div id="doc-tree-app"></div>
+
+  <script>
+    /**
+     * DocTree - 文档目录树组件
+     *
+     * 使用方式:
+     *   DocTree.init(el, config)
+     *
+     * config 配置:
+     *   syncData(action, reqData) => Promise<{tree, error, success}>
+     *   container: { maxHeight, width }
+     *   enableDrag: boolean
+     */
+    const DocTree = (() => {
+      // 最大递归深度
+      const MAX_DEPTH = 10;
+
+      /**
+       * 生成递归节点模板（利用 Alpine x-for 变量作用域遮蔽实现递归）
+       * depth=0 时迭代 tree，depth>0 时迭代上层 node.children
+       */
+      function _nodeTemplate(depth) {
+        if (depth > MAX_DEPTH) return '';
+
+        const source = depth === 0 ? 'tree' : 'node.children';
+        const childrenTemplate = _nodeTemplate(depth + 1);
+        const hasChildBlock = childrenTemplate
+          ? `<div x-show="node.expanded && node.children && node.children.length > 0" class="pl-4">
+               <ul :data-parent-id="node.id">
+                 ${childrenTemplate}
+               </ul>
+             </div>`
+          : '';
+
+        return `
+          <template x-for="node in ${source}" :key="node.id">
+            <li :data-node-id="node.id" class="tree-node-item">
+              <!-- 节点行 -->
+              <div class="flex items-center px-2 py-1 hover:bg-gray-50 cursor-pointer group"
+                   :class="{ 'bg-blue-50': selectedId === node.id }"
+                   @click="selectNode(node)"
+                   @dblclick="startEditing(node)"
+                   @contextmenu.prevent="openContextMenu($event, node)">
+                <!-- 展开/收拢 -->
+                <button @click.stop="toggleExpand(node)"
+                        class="w-5 h-5 flex items-center justify-center text-gray-400 hover:text-gray-600 mr-0.5 flex-shrink-0"
+                        :class="{ 'invisible': !node.children || node.children.length === 0 }">
+                  <svg class="w-3 h-3 transition-transform duration-200"
+                       :class="{ 'rotate-90': node.expanded }"
+                       viewBox="0 0 20 20" fill="currentColor">
+                    <path fill-rule="evenodd"
+                          d="M7.293 14.707a1 1 0 010-1.414L10.586 10 7.293 6.707a1 1 0 011.414-1.414l4 4a1 1 0 010 1.414l-4 4a1 1 0 01-1.414 0z"
+                          clip-rule="evenodd"/>
+                  </svg>
+                </button>
+                <!-- 图标 -->
+                <span class="mr-1 text-sm flex-shrink-0"
+                      x-text="node.children && node.children.length > 0 ? (node.expanded ? '📂' : '📁') : '📄'"></span>
+                <!-- 名称 / 编辑框 -->
+                <template x-if="editingId !== node.id">
+                  <span class="text-sm text-gray-700 truncate flex-1" x-text="node.name"></span>
+                </template>
+                <template x-if="editingId === node.id">
+                  <input type="text"
+                         :value="node.name"
+                         @keydown.enter="finishEditing(node, $event.target.value)"
+                         @keydown.escape="cancelEditing()"
+                         @blur="finishEditing(node, $event.target.value)"
+                         @click.stop
+                         class="text-sm border border-blue-400 rounded px-1 py-0 flex-1 outline-none focus:ring-1 focus:ring-blue-300 min-w-0"
+                         x-init="$nextTick(() => { $el.focus(); $el.select(); })">
+                </template>
+              </div>
+              <!-- 子节点 -->
+              ${hasChildBlock}
+            </li>
+          </template>`;
+      }
+
+      return {
+        /**
+         * 初始化树组件
+         * @param {string|HTMLElement} el  容器
+         * @param {Object} config          配置
+         */
+        init(el, config) {
+          const container = typeof el === 'string' ? document.querySelector(el) : el;
+          if (!container) { console.error('DocTree: 容器未找到'); return; }
+
+          const maxH = config.container?.maxHeight || '500px';
+          const width = config.container?.width || '300px';
+
+          // 保存配置到容器的 dataset 属性所无法胜任的地方 → 用闭包
+          // Alpine 通过 _dtCfg 读取
+          container._dtCfg = config;
+
+          container.innerHTML = `
+            <div x-data="docTree($el.parentElement._dtCfg)" x-init="init()" x-cloak
+                 class="bg-white rounded-lg shadow-md border border-gray-200 overflow-hidden select-none relative"
+                 style="width:${width};"
+                 @click="closeContextMenu()">
+
+              <!-- 标题 -->
+              <div class="px-3 py-2 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
+                <span class="text-sm font-medium text-gray-700">📁 文档目录</span>
+                <button @click="addRootNode()"
+                        class="text-xs text-blue-500 hover:text-blue-700 px-2 py-0.5 rounded hover:bg-blue-50 transition-colors"
+                        title="新增根节点">+ 新增</button>
+              </div>
+
+              <!-- 加载中 -->
+              <div x-show="loading" class="flex items-center justify-center py-8">
+                <svg class="animate-spin h-5 w-5 text-blue-500" viewBox="0 0 24 24">
+                  <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"/>
+                  <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                </svg>
+                <span class="ml-2 text-sm text-gray-500">加载中...</span>
+              </div>
+
+              <!-- 空态 -->
+              <div x-show="!loading && tree.length === 0" class="py-8 text-center text-sm text-gray-400">
+                暂无数据，点击「+ 新增」添加
+              </div>
+
+              <!-- 树列表 -->
+              <div x-show="!loading && tree.length > 0"
+                   class="tree-scroll overflow-y-auto overflow-x-hidden"
+                   style="max-height:${maxH};">
+                <ul class="py-1" data-parent-id="">
+                  ${_nodeTemplate(0)}
+                </ul>
+              </div>
+
+              <!-- 错误提示 -->
+              <div x-show="errorMsg" x-transition
+                   class="mx-2 mb-2 mt-1 px-3 py-2 bg-red-50 border border-red-200 rounded text-xs text-red-600 flex items-center justify-between">
+                <span x-text="errorMsg"></span>
+                <button @click="errorMsg=''" class="text-red-400 hover:text-red-600 ml-2">&times;</button>
+              </div>
+
+              <!-- 右键菜单 -->
+              <div x-show="ctx.show" x-transition.opacity
+                   class="fixed bg-white rounded-lg shadow-lg border border-gray-200 py-1 z-50"
+                   :style="'left:'+ctx.x+'px;top:'+ctx.y+'px;min-width:140px;'"
+                   @click.stop>
+                <button @click="ctxAction('add_child')"  class="w-full text-left px-4 py-1.5 text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-700">➕ 新增子节点</button>
+                <button @click="ctxAction('add_sibling')" class="w-full text-left px-4 py-1.5 text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-700">➕ 新增同级</button>
+                <div class="border-t border-gray-100 my-1"></div>
+                <button @click="ctxAction('copy')"    class="w-full text-left px-4 py-1.5 text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-700">📋 复制</button>
+                <button @click="ctxAction('rename')"  class="w-full text-left px-4 py-1.5 text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-700">✏️ 重命名</button>
+                <div class="border-t border-gray-100 my-1"></div>
+                <button @click="ctxAction('delete')"  class="w-full text-left px-4 py-1.5 text-sm text-red-600 hover:bg-red-50">🗑️ 删除</button>
+              </div>
+            </div>`;
+        }
+      };
+    })();
+
+    /* ------------------------------------------------------------------ */
+    /*  Alpine 组件                                                        */
+    /* ------------------------------------------------------------------ */
+    document.addEventListener('alpine:init', () => {
+      Alpine.data('docTree', (cfg) => ({
+        // --- state ---
+        tree: [],
+        loading: false,
+        errorMsg: '',
+        selectedId: null,
+        editingId: null,
+        _editingBusy: false,          // 防止 blur+enter 双触发
+        ctx: { show: false, x: 0, y: 0, node: null },
+        _sortables: [],
+
+        // --- config ---
+        _cfg: cfg,
+        get _enableDrag() { return this._cfg.enableDrag !== false; },
+
+        // ==================== 生命周期 ====================
+        async init() {
+          await this._load();
+          this._initDrag();
+        },
+
+        // ==================== 数据加载 ====================
+        async _load() {
+          this.loading = true;
+          this.errorMsg = '';
+          const res = await this._sync('init', {});
+          if (res.success) this.tree = this._norm(res.tree || []);
+          this.loading = false;
+        },
+
+        /** 调用用户提供的 syncData */
+        async _sync(action, data) {
+          if (!this._cfg.syncData) {
+            return { tree: this.tree, error: 'syncData 未配置', success: false };
+          }
+          try {
+            const r = await this._cfg.syncData(action, data);
+            if (!r.success) this.errorMsg = r.error || '操作失败';
+            return r;
+          } catch (e) {
+            this.errorMsg = e.message || '请求异常';
+            return { tree: this.tree, error: e.message, success: false };
+          }
+        },
+
+        /** 补全 expanded 字段 */
+        _norm(nodes) {
+          return (nodes || []).map(n => ({
+            ...n,
+            expanded: n.expanded ?? false,
+            children: this._norm(n.children)
+          }));
+        },
+
+        /** 更新整棵树（保留已展开状态） */
+        _applyTree(newTree) {
+          const expandedSet = new Set();
+          const collect = (ns) => ns.forEach(n => {
+            if (n.expanded) expandedSet.add(n.id);
+            if (n.children) collect(n.children);
+          });
+          collect(this.tree);
+
+          const restore = (ns) => ns.map(n => ({
+            ...n,
+            expanded: expandedSet.has(n.id),
+            children: restore(n.children || [])
+          }));
+          this.tree = restore(newTree);
+          this.$nextTick(() => this._initDrag());
+        },
+
+        // ==================== 节点操作 ====================
+        selectNode(node) { this.selectedId = node.id; },
+
+        toggleExpand(node) {
+          node.expanded = !node.expanded;
+          if (node.expanded) this.$nextTick(() => this._initDrag());
+        },
+
+        // --- 重命名 ---
+        startEditing(node) { this.editingId = node.id; this._editingBusy = false; },
+        cancelEditing() { this.editingId = null; },
+        async finishEditing(node, val) {
+          if (this._editingBusy || this.editingId !== node.id) return;
+          this._editingBusy = true;
+          this.editingId = null;
+          val = (val || '').trim();
+          if (!val || val === node.name) return;
+          const old = node.name;
+          node.name = val;
+          const r = await this._sync('rename', { id: node.id, name: val });
+          if (r.success && r.tree) this._applyTree(r.tree);
+          else if (!r.success) node.name = old;
+        },
+
+        // --- 右键菜单 ---
+        openContextMenu(e, node) {
+          this.selectedId = node.id;
+          this.ctx = { show: true, x: e.clientX, y: e.clientY, node };
+        },
+        closeContextMenu() { this.ctx.show = false; },
+
+        async ctxAction(action) {
+          const node = this.ctx.node;
+          this.closeContextMenu();
+          if (!node) return;
+          if (action === 'rename') { this.startEditing(node); return; }
+          if (action === 'delete') { await this._deleteNode(node); return; }
+
+          // add_child / add_sibling / copy
+          const payload = action === 'add_child'
+            ? { parentId: node.id }
+            : { id: node.id };
+          const r = await this._sync(action, payload);
+          if (r.success && r.tree) {
+            if (action === 'add_child') {
+              // 标记父节点已展开，以便 _applyTree 保留
+              node.expanded = true;
+            }
+            this._applyTree(r.tree);
+          }
+        },
+
+        async _deleteNode(node) {
+          if (!confirm(`确定删除「${node.name}」？`)) return;
+          const r = await this._sync('delete', { id: node.id });
+          if (r.success && r.tree) {
+            if (this.selectedId === node.id) this.selectedId = null;
+            this._applyTree(r.tree);
+          }
+        },
+
+        async addRootNode() {
+          const r = await this._sync('add_child', { parentId: null });
+          if (r.success && r.tree) this._applyTree(r.tree);
+        },
+
+        // ==================== 查找辅助 ====================
+        _find(nodes, id) {
+          for (const n of nodes) {
+            if (n.id === id) return n;
+            if (n.children) { const f = this._find(n.children, id); if (f) return f; }
+          }
+          return null;
+        },
+
+        // ==================== 拖拽 ====================
+        _initDrag() {
+          if (!this._enableDrag) return;
+          // 销毁旧实例
+          this._sortables.forEach(s => { try { s.destroy(); } catch(_){} });
+          this._sortables = [];
+
+          const self = this;
+          this.$el.querySelectorAll('ul').forEach(ul => {
+            self._sortables.push(new Sortable(ul, {
+              group: 'doc-tree',
+              animation: 150,
+              fallbackOnBody: true,
+              swapThreshold: 0.65,
+              ghostClass: 'sortable-ghost',
+              chosenClass: 'sortable-chosen',
+              dragClass: 'sortable-drag',
+              async onEnd(evt) {
+                const id = evt.item.dataset?.nodeId;
+                if (!id) return;
+                const newParentId = evt.to.dataset?.parentId || null;
+                const r = await self._sync('move', {
+                  id,
+                  newParentId: newParentId || null,
+                  newIndex: evt.newIndex
+                });
+                if (r.success && r.tree) self._applyTree(r.tree);
+              }
+            }));
+          });
+        }
+      }));
+    });
+  </script>
+
+  <!-- ===================== 演示：模拟后端 ===================== -->
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      /* ---------- mock 数据 ---------- */
+      let _nextId = 100;
+      let _mockTree = [
+        { id:'1', name:'项目文档', children:[
+          { id:'2', name:'需求文档', children:[
+            { id:'5', name:'功能需求.md', children:[] },
+            { id:'6', name:'非功能需求.md', children:[] }
+          ]},
+          { id:'3', name:'设计文档', children:[
+            { id:'7', name:'架构设计.md', children:[] },
+            { id:'8', name:'数据库设计.md', children:[] }
+          ]},
+          { id:'4', name:'API文档', children:[] }
+        ]},
+        { id:'10', name:'会议纪要', children:[
+          { id:'11', name:'2024年Q1', children:[
+            { id:'12', name:'1月周会.md', children:[] },
+            { id:'13', name:'2月周会.md', children:[] },
+            { id:'14', name:'3月周会.md', children:[] }
+          ]},
+          { id:'15', name:'2024年Q2', children:[] }
+        ]},
+        { id:'20', name:'技术分享', children:[
+          { id:'21', name:'Docker入门.md', children:[] },
+          { id:'22', name:'Kubernetes实战.md', children:[] }
+        ]}
+      ];
+
+      const _clone = o => JSON.parse(JSON.stringify(o));
+
+      function _find(ns, id) {
+        for (const n of ns) {
+          if (n.id === id) return n;
+          if (n.children) { const f = _find(n.children, id); if (f) return f; }
+        }
+        return null;
+      }
+      function _parent(ns, id, p) {
+        for (const n of ns) {
+          if (n.id === id) return p === undefined ? null : p;
+          if (n.children) { const f = _parent(n.children, id, n); if (f !== undefined) return f; }
+        }
+      }
+      function _remove(ns, id) {
+        for (let i = 0; i < ns.length; i++) {
+          if (ns[i].id === id) return ns.splice(i, 1)[0];
+          if (ns[i].children) { const r = _remove(ns[i].children, id); if (r) return r; }
+        }
+        return null;
+      }
+      function _copyDeep(n) {
+        return { id: String(_nextId++), name: n.name + ' (副本)', children: (n.children||[]).map(_copyDeep) };
+      }
+
+      /* ---------- 配置 ---------- */
+      const treeConfig = {
+        syncData: async (action, req) => {
+          await new Promise(r => setTimeout(r, 150));
+          console.log('[mock]', action, req);
+          try {
+            switch (action) {
+              case 'init':
+                return { tree: _clone(_mockTree), error: '', success: true };
+
+              case 'add_child': {
+                const nn = { id: String(_nextId++), name: '新建文档', children: [] };
+                if (!req.parentId) { _mockTree.push(nn); }
+                else { const p = _find(_mockTree, req.parentId); if (p) { p.children = p.children||[]; p.children.push(nn); } }
+                return { tree: _clone(_mockTree), error: '', success: true };
+              }
+              case 'add_sibling': {
+                const nn = { id: String(_nextId++), name: '新建文档', children: [] };
+                const p = _parent(_mockTree, req.id);
+                const list = p ? p.children : _mockTree;
+                const idx = list.findIndex(n => n.id === req.id);
+                list.splice(idx + 1, 0, nn);
+                return { tree: _clone(_mockTree), error: '', success: true };
+              }
+              case 'rename': {
+                const n = _find(_mockTree, req.id); if (n) n.name = req.name;
+                return { tree: _clone(_mockTree), error: '', success: true };
+              }
+              case 'copy': {
+                const src = _find(_mockTree, req.id);
+                if (src) {
+                  const cp = _copyDeep(src);
+                  const p = _parent(_mockTree, req.id);
+                  const list = p ? p.children : _mockTree;
+                  const idx = list.findIndex(n => n.id === req.id);
+                  list.splice(idx + 1, 0, cp);
+                }
+                return { tree: _clone(_mockTree), error: '', success: true };
+              }
+              case 'delete': {
+                _remove(_mockTree, req.id);
+                return { tree: _clone(_mockTree), error: '', success: true };
+              }
+              case 'move': {
+                const moved = _remove(_mockTree, req.id);
+                if (moved) {
+                  const list = req.newParentId ? (_find(_mockTree, req.newParentId)?.children ?? _mockTree) : _mockTree;
+                  list.splice(req.newIndex, 0, moved);
+                }
+                return { tree: _clone(_mockTree), error: '', success: true };
+              }
+              default:
+                return { tree: _clone(_mockTree), error: '未知操作', success: false };
+            }
+          } catch (e) {
+            return { tree: _clone(_mockTree), error: e.message, success: false };
+          }
+        },
+        container: { maxHeight: '500px', width: '320px' },
+        enableDrag: true
+      };
+
+      DocTree.init('#doc-tree-app', treeConfig);
+    });
+  </script>
+</body>
+</html>
